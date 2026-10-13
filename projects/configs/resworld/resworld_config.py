@@ -164,26 +164,24 @@ model = dict(
         # ||sum_k P_k P_k^T - I||_F / sqrt(dim) (~< 0.05) and raise if the projectors drift.
         lambda_opf_orth=0.1,
         lambda_opf_fac=1.0,
-        # gamma_fac is the activity floor of L_fac. With samples_per_gpu=2 and
-        # num_scenes=16 the per-rank sigma is estimated from only 32 rows
-        # (SE ~13%; the 4-GPU DDP gradient average halves the aggregate noise), which
-        # was measured to be harmless for the hinge itself. What matters is gamma,
-        # because L_fac can only fire on coordinates whose sigma falls below it.
-        # The head now reports the numbers needed to pick it, in every log line /
-        # TensorBoard scalar: opf_sigma_min / opf_sigma_p05 / opf_sigma_p25 /
-        # opf_sigma_med (the per-coordinate activity distribution over the 256
-        # projected coordinates), opf_act_rate (fraction of coordinates below
-        # gamma_fac -- while this is 0 the term is inert) and opf_ident_err
-        # (||sum_k P_k P_k^T - I||_F / sqrt(dim), keep below ~0.05). Set gamma_fac
-        # near the LOWER TAIL of that distribution (e.g. just above opf_sigma_min,
-        # around opf_sigma_p05). To read the untouched distribution first, run the
-        # warmup without the term (it changes nothing while opf_act_rate stays 0):
-        #   bash tools/dist_train.sh projects/configs/resworld/resworld_config.py 4 \
-        #       --cfg-options model.pts_bbox_head.lambda_opf_fac=0.0
-        # then restore lambda_opf_fac=1.0 and set gamma_fac from the logged sigma.
-        # Setting it too high makes L_fac fight L_orth and drag the projectors off
-        # the orthogonal partition; keep it below the healthy sigma level.
-        gamma_fac=0.1,
+        # gamma_fac is the activity floor of L_fac, so it must be calibrated to the
+        # MEASURED sigma scale -- the term can only fire on coordinates whose sigma
+        # falls below it. The head logs the calibration data every log interval:
+        #   opf_sigma_min/p05/p25/med -- activity distribution over the 256 coordinates
+        #   opf_act_rate             -- fraction below gamma_fac; target ~0.01-0.05
+        #                               (0 = the term is inert, 1 = it fires on all)
+        #   opf_ident_err            -- ||sum_k P_k P_k^T - I||_F/sqrt(dim), keep < 0.05
+        # Measured on nuScenes, epoch 1 iters 100-1300: sigma_min ~1.4e-3,
+        # sigma_p05 ~2.8e-3, sigma_med ~5e-3 -> 7.5e-3. The projected residuals live at
+        # a scale of ~1e-2, i.e. ~20-50x below the 0.1 default, and with gamma_fac=0.1
+        # opf_act_rate was pinned at 1.0000 (opf_fac_raw = gamma - mean(sigma) = 0.0942
+        # exactly), so L_fac degenerated into a blanket "maximise the projected spread"
+        # pressure fighting L_orth instead of reviving dead coordinates. 0.002 sits just
+        # above sigma_min (~0.25 x sigma_med), so only the weakest few percent fire.
+        # Note the asymmetry: too low is merely inert (safe, and correct when no factor
+        # is actually degenerate), too high drags the projectors off the orthogonal
+        # partition (harmful) -- so tune downwards when in doubt.
+        gamma_fac=0.002,
         way_decoder=dict(
             type='CustomTransformerDecoder',
             num_layers=1,
