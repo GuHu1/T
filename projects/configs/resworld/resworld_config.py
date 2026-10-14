@@ -164,24 +164,27 @@ model = dict(
         # ||sum_k P_k P_k^T - I||_F / sqrt(dim) (~< 0.05) and raise if the projectors drift.
         lambda_opf_orth=0.1,
         lambda_opf_fac=1.0,
-        # gamma_fac is the activity floor of L_fac, so it must be calibrated to the
-        # MEASURED sigma scale -- the term can only fire on coordinates whose sigma
-        # falls below it. The head logs the calibration data every log interval:
-        #   opf_sigma_min/p05/p25/med -- activity distribution over the 256 coordinates
-        #   opf_act_rate             -- fraction below gamma_fac; target ~0.01-0.05
-        #                               (0 = the term is inert, 1 = it fires on all)
-        #   opf_ident_err            -- ||sum_k P_k P_k^T - I||_F/sqrt(dim), keep < 0.05
-        # Measured on nuScenes, epoch 1 iters 100-1300: sigma_min ~1.4e-3,
-        # sigma_p05 ~2.8e-3, sigma_med ~5e-3 -> 7.5e-3. The projected residuals live at
-        # a scale of ~1e-2, i.e. ~20-50x below the 0.1 default, and with gamma_fac=0.1
-        # opf_act_rate was pinned at 1.0000 (opf_fac_raw = gamma - mean(sigma) = 0.0942
-        # exactly), so L_fac degenerated into a blanket "maximise the projected spread"
-        # pressure fighting L_orth instead of reviving dead coordinates. 0.002 sits just
-        # above sigma_min (~0.25 x sigma_med), so only the weakest few percent fire.
-        # Note the asymmetry: too low is merely inert (safe, and correct when no factor
-        # is actually degenerate), too high drags the projectors off the orthogonal
-        # partition (harmful) -- so tune downwards when in doubt.
-        gamma_fac=0.002,
+        # gamma_fac / gamma_fac_ratio set the activity floor gamma of L_fac. The term
+        # can only fire on coordinates whose sigma falls below gamma, so gamma must
+        # track the sigma scale -- and that scale is NOT constant: measured on
+        # nuScenes it grows ~4x for the median (4.8e-3 -> 1.9e-2) and ~16x for the
+        # minimum (2e-4 -> 3.3e-3) from epoch 1 to epoch 4, as the residual
+        # representation keeps expanding. A fixed absolute gamma therefore stops
+        # firing after a few epochs.
+        #   gamma_fac_ratio > 0: gamma = max(gamma_fac, gamma_fac_ratio * median(sigma))
+        #     keeps the active fraction stable across epochs; gamma_fac then only acts
+        #     as a never-vanish floor (0.0 = rely on the ratio alone).
+        #   gamma_fac_ratio = 0.0: the paper's fixed absolute floor gamma_fac is used.
+        # Reference point: with gamma_fac=0.1 the floor sat ~20-50x above the entire
+        # sigma distribution, opf_act_rate was pinned at 1.0000 (opf_fac_raw =
+        # gamma - mean(sigma) = 0.0942 exactly) and L_fac degenerated into a blanket
+        # "maximise the projected spread" pressure fighting L_orth.
+        # Calibrate from the logged opf_gamma / opf_sigma_min,p05,p25,med /
+        # opf_act_rate (target ~0.01-0.05: 0 = inert, 1 = fires on everything) and
+        # opf_ident_err (keep < 0.05). Too low is merely inert (safe); too high drags
+        # the projectors off the orthogonal partition (harmful) -- tune downwards.
+        gamma_fac=0.0,
+        gamma_fac_ratio=0.25,
         way_decoder=dict(
             type='CustomTransformerDecoder',
             num_layers=1,

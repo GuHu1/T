@@ -191,6 +191,7 @@ class ResWorldHead(BaseModule):
                  lambda_opf_orth=1.0,
                  lambda_opf_fac=1.0,
                  gamma_fac=0.1,
+                 gamma_fac_ratio=0.0,
                  ego_fut_mode=3,
                  loss_plan_reg=dict(type='L1Loss', loss_weight=0.25),
                  ego_lcf_feat_idx=None,
@@ -221,6 +222,7 @@ class ResWorldHead(BaseModule):
         self.lambda_opf_orth = lambda_opf_orth
         self.lambda_opf_fac = lambda_opf_fac
         self.gamma_fac = gamma_fac
+        self.gamma_fac_ratio = gamma_fac_ratio
         self.grid_min = torch.tensor([grid_config['x'][0], grid_config['y'][0]])
         self.grid_max = torch.tensor([grid_config['x'][1], grid_config['y'][1]])
         self.grid_size = torch.tensor([grid_config['x'][2], grid_config['y'][2]])
@@ -490,6 +492,34 @@ class ResWorldHead(BaseModule):
 
         return loss_dict
 
+    def resolve_gamma(self, z_target):
+        """Activity floor gamma_fac used by L_fac.
+
+        ``gamma_fac`` is an absolute floor and must be calibrated to the sigma scale,
+        but that scale is not constant: measured on nuScenes it grows by ~4x (median)
+        to ~16x (minimum) over the first four epochs, so a fixed absolute gamma
+        progressively stops firing as the representation grows.
+
+        * ``gamma_fac_ratio <= 0`` (default): the absolute ``gamma_fac`` is used, i.e.
+          the paper's fixed floor.
+        * ``gamma_fac_ratio > 0``: the floor follows the representation scale,
+          ``gamma = max(gamma_fac, gamma_fac_ratio * median(sigma))``, so the fraction
+          of coordinates that L_fac acts on stays put across epochs instead of
+          vanishing. ``gamma_fac`` then only acts as a never-vanish floor.
+
+        The median is detached, so gamma is a per-step constant: the term keeps its
+        single gradient path (through sigma inside the hinge) and no gradient flows
+        back through the threshold.
+        """
+        floor = torch.as_tensor(
+            self.gamma_fac, device=z_target[0].device, dtype=torch.float32)
+        if self.gamma_fac_ratio <= 0:
+            return floor
+        with torch.no_grad():
+            sigma = torch.cat([z.reshape(-1, self.opf.rank).std(dim=0).float()
+                               for z in z_target])
+            return torch.max(floor, self.gamma_fac_ratio * sigma.median())
+
     def opf_losses(self, preds_dicts):
         """Auxiliary-prediction, orthogonality and factor-activity terms of OPF.
 
@@ -521,14 +551,17 @@ class ResWorldHead(BaseModule):
             for j in range(i + 1, num_factors):
                 loss_orth = loss_orth + (projections[i].t() @ projections[j]).pow(2).sum()
 
-        # L_fac = mean_{k,j} max(0, gamma_fac - sigma_{k,j}). torch.std is used
-        # directly: its backward is safe at zero variance (returns 0, verified) and
-        # gives a scale-free revival force for nearly collapsed coordinates, which
-        # the paper's sqrt(Var + eps) form would damp by the same eps.
+        # L_fac = mean_{k,j} max(0, gamma - sigma_{k,j}), with gamma resolved by
+        # resolve_gamma (the absolute gamma_fac, or a fixed ratio of the current
+        # median sigma). torch.std is used directly: its backward is safe at zero
+        # variance (returns 0, verified) and gives a scale-free revival force for
+        # nearly collapsed coordinates, which the paper's sqrt(Var + eps) form would
+        # damp by the same eps.
+        gamma = self.resolve_gamma(z_target).to(ref.dtype)
         loss_fac = ref.new_zeros(())
         for z_k in z_target:
             sigma = z_k.reshape(-1, rank).std(dim=0)
-            loss_fac = loss_fac + F.relu(self.gamma_fac - sigma).sum()
+            loss_fac = loss_fac + F.relu(gamma - sigma).sum()
         loss_fac = loss_fac / (num_factors * rank)
 
         stats = self.opf_stats(z_target, loss_aux, loss_orth, loss_fac)
@@ -551,8 +584,12 @@ class ResWorldHead(BaseModule):
           ``num_factors * rank == dim`` projected coordinates. A single coordinate is
           estimated from only ``bs * num_scenes`` rows (32 with samples_per_gpu=2), but
           these quantiles aggregate 256 coordinates and the median is stable to ~1%;
+        * ``opf_gamma`` -- the activity floor actually used this step, i.e. the value
+          returned by ``resolve_gamma`` (equal to ``gamma_fac`` in the default
+          absolute mode, or ``gamma_fac_ratio * median(sigma)`` in ratio mode). It is
+          needed to read ``opf_act_rate`` when the floor is scale-following;
         * ``opf_act_rate`` -- fraction of coordinates whose sigma falls below
-          ``gamma_fac``, i.e. whether L_fac fires at all. While it is 0 the term is
+          ``gamma``, i.e. whether L_fac fires at all. While it is 0 the term is
           inert; as it approaches 1 the term starts dragging the projectors off the
           orthogonal partition and fighting L_orth;
         * ``opf_ident_err`` -- ``||sum_k P_k P_k^T - I||_F / sqrt(dim)``, the deviation
@@ -567,8 +604,7 @@ class ResWorldHead(BaseModule):
 
             sigma = torch.cat(
                 [z.reshape(-1, rank).std(dim=0) for z in z_target]).float()
-            gamma = torch.as_tensor(self.gamma_fac, device=sigma.device,
-                                    dtype=sigma.dtype)
+            gamma = self.resolve_gamma(z_target).to(sigma.dtype)
             act_rate = (sigma < gamma).to(sigma.dtype).mean()
             quant = torch.quantile(
                 sigma, sigma.new_tensor([0.05, 0.25, 0.5]))
@@ -586,6 +622,7 @@ class ResWorldHead(BaseModule):
                 'opf_sigma_p05': quant[0].to(dtype),
                 'opf_sigma_p25': quant[1].to(dtype),
                 'opf_sigma_med': quant[2].to(dtype),
+                'opf_gamma': gamma.to(dtype),
                 'opf_act_rate': act_rate.to(dtype),
                 'opf_ident_err': ident_err.to(dtype),
             }
